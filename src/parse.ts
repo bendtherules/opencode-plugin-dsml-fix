@@ -246,7 +246,8 @@ function parseParameters(body: string, options: Required<ParseOptions>): Record<
   const strict = collectParameters(body, parameterRe())
   // If the strict scan produced nothing, or one value ran away into the next
   // parameter (the vLLM mis-closed-closer leak), retry with the tolerant scan. (V11)
-  // The tolerant scan is a relaxed-mode rescue; strict mode keeps the strict result.
+  // The tolerant scan applies when `looseParameters` is on; otherwise the
+  // strict result stands as-is.
   const ranAway = Object.values(strict).some((value) => typeof value === "string" && value.includes("DSML"))
   const picked =
     options.looseParameters && (Object.keys(strict).length === 0 || ranAway)

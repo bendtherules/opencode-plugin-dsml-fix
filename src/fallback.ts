@@ -1,12 +1,13 @@
 /**
- * Strategy A: auto-resume safety net for turns the streaming middleware could not
- * recover. Pure decision logic lives here so it is unit-testable; OpenCode I/O
- * (events, session reads, synthetic prompts, storage) is injected by `src/index.ts`.
+ * Retry safety net for turns the live fix could not recover. Pure decision logic
+ * lives here so it is unit-testable; OpenCode I/O (events, session reads,
+ * synthetic prompts, storage) is injected by `src/index.ts`.
  *
- * Policy: when a session goes idle and its latest assistant text ends in DSML markup
+ * Policy: when a session goes idle and its latest assistant text holds DSML markup
  * that never became a tool call, send one short correction nudge (see
- * `src/prompt.ts`). Attempts are capped per message so a pathological loop cannot
- * run away.
+ * `src/prompt.ts`). Send-once per message: a message that stays silent after one
+ * wake is left alone, never re-poked — if the first poke got no reply the cause
+ * is outside anything a second poke can fix.
  */
 
 import { looksLikeDsml } from "./grammar.ts"
@@ -18,7 +19,7 @@ export interface FallbackDecision {
   readonly send: boolean
   /** The nudge text, present when `send` is true. */
   readonly text?: string
-  /** Storage key the attempt was (or would be) counted under. */
+  /** Storage key the send was (or would be) recorded under. */
   readonly key?: string
   /** Why no nudge is sent. */
   readonly reason?: string
@@ -46,13 +47,13 @@ export interface HookMessage {
 }
 
 export interface SystemNudge {
-  /** Cap key: message id when present, otherwise a hash of the text. */
+  /** Dedupe key: message id when present, otherwise a hash of the text. */
   readonly key: string
   /** The correction text for the system channel. */
   readonly text: string
 }
 
-/** Stable cap key for a hook message: id when present, content hash otherwise. */
+/** Stable dedupe key for a hook message: id when present, content hash otherwise. */
 export function nudgeCapKey(message: HookMessage): string {
   if (message.id) return message.id
   return contentHash(message)
@@ -83,7 +84,7 @@ export function turnId(messages: ReadonlyArray<HookMessage>): string {
 /**
  * Decide whether the assembled request history ends in unrecovered DSML and needs
  * the correction as a transient system instruction. Pure: the caller enforces the
- * per-key cap via storage. Returns undefined when no nudge is warranted.
+ * send-once rule via storage. Returns undefined when no nudge is warranted.
  */
 export function needsSystemNudge(
   messages: ReadonlyArray<HookMessage>,
@@ -100,16 +101,17 @@ export function needsSystemNudge(
 
 /**
  * Decide whether the latest assistant text warrants a correction nudge.
+ * Send-once per message: `alreadySent` means this message was already poked
+ * once and stayed silent — leave it alone.
  *
- * @param text the latest assistant text (already stripped of nothing)
- * @param attempts nudges already sent for this message
- * @param maxAttempts cap from config
+ * @param text the latest assistant text
+ * @param alreadySent whether a nudge/wake was already sent for this message
  */
-export function decideResume(text: string, attempts: number, maxAttempts: number): FallbackDecision {
+export function decideResume(text: string, alreadySent: boolean): FallbackDecision {
   if (!looksLikeDsml(text)) return { send: false, reason: "no-marker" }
   const { calls } = parseDsml(text)
   if (calls.length > 0) return { send: false, reason: "already-recoverable" }
-  if (attempts >= maxAttempts) return { send: false, reason: "cap-reached" }
+  if (alreadySent) return { send: false, reason: "already-sent" }
   return { send: true, text: recoveryNudge() }
 }
 
@@ -124,8 +126,7 @@ export function messageText(message: {
   return parts.map((part) => part.text as string).join("\n")
 }
 
-/** Parse an attempt counter value read from storage. */
-export function parseAttempts(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.floor(value)
-  return 0
+/** Read a send-once flag from storage. Any truthy value means already sent. */
+export function alreadySent(value: unknown): boolean {
+  return value === true || value === 1 || value === "1"
 }

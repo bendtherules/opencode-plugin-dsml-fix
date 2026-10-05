@@ -83,13 +83,13 @@ fragment. This row therefore expects `calls: []`, `ranges: [the parameter markup
 
 | ID | Fixture | Expect |
 |----|---------|--------|
-| `config-defaults` | `resolveConfig()` | both Zen providers, relaxed, resume 3 |
-| `config-strict` | `mode:"strict"` | every rescue off |
-| `config-granular` | one rescue off | others stay on |
-| `strict-block` | complete block + strict flags | parses |
-| `strict-orphan` | orphan invoke + strict flags | no call |
-| `prompt-no-marker` | both directives | no live marker bytes, outer-layer rule stated |
-| `fallback-*` | decide/messageText/attempts | nudge policy + cap |
+| `config-defaults` | `resolveConfig()` | both Zen providers, all flags on, debug off |
+| `config-granular` | one parse flag off | others stay on |
+| `config-layers` | each layer off | that layer disabled |
+| `parse-flags-off` | complete block + all flags off | parses |
+| `parse-orphan-off` | orphan invoke + flags off | no call |
+| `prompt-no-marker` | recovery nudge | no live marker bytes, outer-layer rule stated |
+| `fallback-*` | decide/messageText/send-once | nudge policy + send-once |
 
 ## Wrapper: `wrapDsmlLanguageModel`
 

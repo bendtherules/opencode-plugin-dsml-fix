@@ -121,10 +121,14 @@ when zero calls were recovered — unclosed/unparseable tails emit verbatim.
 - `v12` runaway invoke name (`name="tool {`) → no call, strip.
 - Code fences are never parsed or stripped.
 - Message that already has native tool calls → strip leaked text only, do not re-run.
-- Strategy A test-only for now: on idle, if last assistant text ends in DSML, send a
-  synthetic correction nudge, capped via `ctx.storage`.
+- Strategy A live: on idle, if last assistant text ends in DSML, send a
+  synthetic correction nudge, send-once per message via `ctx.storage`.
 
-## 8. The correction prompt (user's latest requirement)
+## 8. The correction prompt (decided: nudge only, no preventive directive)
+
+> Outcome: the preventive directive was removed — only the recovery-failure
+> nudge shipped (`recoveryNudge()` in `src/prompt.ts`, wired as `retry.nudge`
+> + idle wake). Original requirement below for the record.
 
 When the parser **cannot** recover a call, and as preventive guidance, inject a
 directive telling the model to always emit tool calls in the correct format **with the
@@ -151,46 +155,43 @@ providers is **not yet decided** — ask the user.
    confirm `[dsml]` debug lines + recovery behaviour.
 5. Update `docs/PATTERNS.md`/`TEST-MATRIX.md` as rows move from FAIL to PASS.
 
-## 11. Strategy report (final)
+## 11. Feature report (final)
 
 Per-request (in `context` hook, before the model call):
 
-- **Preventive directive** (`strategies.directive`, default on): appends a fixed
-  ~130-token instruction to `event.system` stating the exact required envelope
-  (complete outer block layer, single bars, one invoke per call, parameters inside
-  invokes). Static bytes every request → one-time prefix shift, then cache-stable.
-- **History sanitization** (`strategies.sanitize`, default on): strips leaked DSML
+- **History sanitization** (`history.sanitize`, default on): strips leaked DSML
   spans from replayed assistant text. Fires only when a leak exists; deterministic
   given stored messages, so retries converge to identical bytes (cache-friendly).
   Never synthesizes calls (no double-execution).
-- **Conditional system nudge** (`strategies.systemNudge`, default on): when the
+- **Conditional nudge** (`retry.nudge`, default on): when the
   assembled history ends in *unrecoverable* DSML, pushes the correction as a
   **transient system instruction** — never persisted, auto-clears when the
-  condition clears. Capped per message (id, else content hash) via storage.
+  condition clears. Send-once per message (id, else content hash) via storage.
 
-Per-response (in `aisdk.language` wrapper, after the provider stream):
+Per-response (live fix, `responseFix.enabled`, default on):
 
-- **B1 streaming** (`strategies.stream`): buffers `text-delta` only, holds partial
+- **AI-SDK path**: buffers `text-delta` only, holds partial
   openers, resolves closed blocks immediately, emits `tool-input-*` + `tool-call`,
   flips `finish` to `tool-calls`. Zero calls → buffer emitted verbatim, finish
   untouched. 64 KiB cap → over-cap unclosed tail emitted as text. Zero request
-  impact → zero cache impact.
-- **B2 generate** (`strategies.generate`): same recovery for non-streaming results.
+  impact → zero cache impact. Same recovery for non-streaming results.
+- **Native SSE path** (`http.response` rewrite, the one `opencode-go` uses):
+  same parser, same policy on raw SSE bytes.
 
-Idle safety net (`strategies.watchdog` + `resume.channel`/`maxAttempts`):
+Retry safety net (`retry.enabled` + `retry.channel`, send-once per message):
 
 - On session idle with unrecovered DSML last message: `channel:"system"` (default)
   sends a minimal synthetic wake ping (`"Resume the interrupted tool call."`) and
   the context hook attaches the full correction in system on the woken turn;
-  `channel:"user"` restores the legacy full-text synthetic turn.
-- Attempts capped per message; counters in plugin storage.
+  `channel:"user"` sends the full correction as a synthetic user turn.
+- One poke per message; a message that stays silent is left alone.
 
-Fixed prompt texts live in `src/prompt.ts` (`preventiveDirective()`,
-`recoveryNudge()`); tests assert they contain no live marker bytes.
+The fixed nudge text lives in `src/prompt.ts` (`recoveryNudge()`); tests assert
+it contains no live marker bytes.
 
 Caching verdict: only stable, deterministic bytes are ever added; nothing in the
 plugin churns per-request content. The one real invalidation is the one-time shift
-when the directive/nudge first appears — expected and unavoidable for any fix, and
+when the nudge first appears — expected and unavoidable for any fix, and
 documented as acceptable.
 
 Rejected alternative: `session.instructions.entry.put` as the nudge channel. It

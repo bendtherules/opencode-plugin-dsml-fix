@@ -1,36 +1,49 @@
-/** Config, mode gating, prompt guards, and fallback decisions. */
+/** Config defaults, per-shape parse flags, prompt guards, and retry decisions. */
 
 import { describe, expect, test } from "bun:test"
 import { appliesToProvider, resolveConfig } from "../src/config.ts"
-import { attemptKey, decideResume, messageText, needsSystemNudge, nudgeCapKey, parseAttempts, wakeText } from "../src/fallback.ts"
+import { alreadySent, attemptKey, decideResume, messageText, needsSystemNudge, nudgeCapKey, turnId, wakeText } from "../src/fallback.ts"
 import { block, invoke, param } from "./fixtures.ts"
 import { parseDsml, redactionNote, stripRangesWithNote } from "../src/parse.ts"
-import { containsLiveMarker, preventiveDirective, recoveryNudge } from "../src/prompt.ts"
+import { containsLiveMarker, recoveryNudge } from "../src/prompt.ts"
 
 describe("config", () => {
-  test("defaults target both Zen providers in relaxed mode", () => {
+  test("defaults: everything protective on, only debug off", () => {
     const c = resolveConfig()
     expect([...c.providers]).toEqual(["opencode-go", "opencode"])
-    expect(c.relaxed).toBe(true)
     expect(c.orphanInvoke).toBe(true)
-    expect(c.watchdogEnabled).toBe(true)
-    expect(c.resumeMaxAttempts).toBe(3)
-    expect(c.directiveEnabled).toBe(true)
-    expect(c.resumeChannel).toBe("system")
-  })
-
-  test("strict mode disables every rescue", () => {
-    const c = resolveConfig({ mode: "strict" })
-    expect(c.relaxed).toBe(false)
-    expect(c.orphanInvoke).toBe(false)
-    expect(c.looseParameters).toBe(false)
-    expect(c.rawJsonBody).toBe(false)
-  })
-
-  test("one rescue can be switched off in isolation", () => {
-    const c = resolveConfig({ rescue: { orphanInvoke: false } })
-    expect(c.orphanInvoke).toBe(false)
     expect(c.looseParameters).toBe(true)
+    expect(c.rawJsonBody).toBe(true)
+    expect(c.wrappedTool).toBe(true)
+    expect(c.responseFixEnabled).toBe(true)
+    expect(c.bufferLimit).toBe(64 * 1024)
+    expect(c.sanitizeEnabled).toBe(true)
+    expect(c.retryEnabled).toBe(true)
+    expect(c.retryNudgeEnabled).toBe(true)
+    expect(c.retryChannel).toBe("system")
+    expect(c.debug).toBe(false)
+  })
+
+  test("one parse shape can be switched off in isolation", () => {
+    const c = resolveConfig({ parse: { wrappedTool: false } })
+    expect(c.wrappedTool).toBe(false)
+    expect(c.orphanInvoke).toBe(true)
+  })
+
+  test("whole layers switch off", () => {
+    const c = resolveConfig({
+      responseFix: { enabled: false },
+      history: { sanitize: false },
+      retry: { enabled: false, nudge: false },
+    })
+    expect(c.responseFixEnabled).toBe(false)
+    expect(c.sanitizeEnabled).toBe(false)
+    expect(c.retryEnabled).toBe(false)
+    expect(c.retryNudgeEnabled).toBe(false)
+  })
+
+  test("retry channel selects delivery", () => {
+    expect(resolveConfig({ retry: { channel: "user" } }).retryChannel).toBe("user")
   })
 
   test("empty providers disables scoping", () => {
@@ -47,104 +60,66 @@ describe("config", () => {
   })
 })
 
-describe("strategy matrix", () => {
-  test("each transport recovers independently", () => {
-    const off = resolveConfig({ recovery: { sse: false } })
-    expect(off.sseEnabled).toBe(false)
-    expect(off.generateEnabled).toBe(true)
-    const all = resolveConfig({
-      recovery: { sse: false, aisdkStream: false, aisdkGenerate: false },
-      request: { sanitize: false, directive: false, systemNudge: false },
-    })
-    expect(all.streamEnabled).toBe(false)
-    expect(all.generateEnabled).toBe(false)
-    expect(all.sanitizeEnabled).toBe(false)
-    expect(all.directiveEnabled).toBe(false)
-    expect(all.systemNudgeEnabled).toBe(false)
-  })
+describe("parse flags", () => {
+  const allOff = { orphanInvoke: false, looseParameters: false, rawJsonBody: false, wrappedTool: false }
 
-  test("recovery/request win over legacy strategies.*", () => {
-    expect(resolveConfig({ strategies: { sse: false } }).sseEnabled).toBe(false)
-    expect(
-      resolveConfig({ strategies: { sse: false }, response: { sse: true } }).sseEnabled,
-    ).toBe(true)
-    expect(
-      resolveConfig({ strategies: { sanitize: false }, request: { sanitize: true } }).sanitizeEnabled,
-    ).toBe(true)
-  })
-
-  test("legacy aliases still work; new names win when set", () => {
-    expect(resolveConfig({ resume: { enabled: false } }).watchdogEnabled).toBe(false)
-    expect(resolveConfig({ prompt: { enabled: false } }).directiveEnabled).toBe(false)
-    expect(resolveConfig({ resume: { enabled: false }, strategies: { watchdog: true } }).watchdogEnabled).toBe(true)
-    expect(resolveConfig({ resume: { channel: "user" } }).resumeChannel).toBe("user")
-  })
-})
-
-describe("strict mode parsing", () => {
-  const strict = { orphanInvoke: false, looseParameters: false, rawJsonBody: false }
-
-  test("complete block still parses", () => {
-    const r = parseDsml(block([invoke("bash", [param("command", "pwd")])]), strict)
+  test("complete block still parses with every flag off", () => {
+    const r = parseDsml(block([invoke("bash", [param("command", "pwd")])]), allOff)
     expect(r.calls).toHaveLength(1)
   })
 
-  test("orphan invoke is not recovered", () => {
-    const r = parseDsml(invoke("edit", [param("path", "a")]), strict)
+  test("orphan invoke is not recovered with its flag off", () => {
+    const r = parseDsml(invoke("edit", [param("path", "a")]), allOff)
     expect(r.calls).toHaveLength(0)
   })
 
-  test("mis-closed parameter is not rescued", () => {
+  test("mis-closed parameter is not rescued with its flag off", () => {
     const a = `<\uFF5CDSML\uFF5Cparameter name="alpha" string="true">first</\uFF5CDSML\uFF5C>`
     const src = block([invoke("r", [a, param("beta", "second")])])
-    const r = parseDsml(src, strict)
-    // Strict keeps the strict scan as-is (runaway value), never the tolerant one.
+    const r = parseDsml(src, allOff)
+    // Without the tolerant scan the strict result stands (runaway value).
     expect(r.calls.map((c) => c.name)).toEqual(["r"])
   })
 })
 
 describe("prompt", () => {
-  test("directives contain no live marker", () => {
-    expect(containsLiveMarker(preventiveDirective())).toBe(false)
+  test("nudge contains no live marker and states the outer-layer rule", () => {
     expect(containsLiveMarker(recoveryNudge("edit"))).toBe(false)
-  })
-
-  test("directive states the outer-layer rule", () => {
-    expect(preventiveDirective()).toContain("outer block")
     expect(recoveryNudge()).toContain("outer")
   })
 })
 
-describe("fallback", () => {
+describe("retry", () => {
   test("no marker → no nudge", () => {
-    expect(decideResume("hello world", 0, 3)).toEqual({ send: false, reason: "no-marker" })
+    expect(decideResume("hello world", false)).toEqual({ send: false, reason: "no-marker" })
   })
 
-  test("recoverable text → no nudge (middleware owns it)", () => {
-    const decision = decideResume(block([invoke("bash", [param("command", "pwd")])]), 0, 3)
+  test("recoverable text → no nudge (live fix owns it)", () => {
+    const decision = decideResume(block([invoke("bash", [param("command", "pwd")])]), false)
     expect(decision.send).toBe(false)
     expect(decision.reason).toBe("already-recoverable")
   })
 
   test("unrecoverable markup → nudge with correction text", () => {
-    const decision = decideResume("broken \uFF5CDSML\uFF5C tool_calls garbage", 0, 3)
+    const decision = decideResume("broken \uFF5CDSML\uFF5C tool_calls garbage", false)
     expect(decision.send).toBe(true)
     expect(decision.text).toContain("outer")
   })
 
-  test("cap is enforced", () => {
-    const decision = decideResume("broken \uFF5CDSML\uFF5C tool_calls garbage", 3, 3)
-    expect(decision).toEqual({ send: false, reason: "cap-reached" })
+  test("send-once: already poked → silence", () => {
+    const decision = decideResume("broken \uFF5CDSML\uFF5C tool_calls garbage", true)
+    expect(decision).toEqual({ send: false, reason: "already-sent" })
   })
 
   test("attempt key is namespaced per message", () => {
     expect(attemptKey("s1", "m1")).not.toBe(attemptKey("s1", "m2"))
   })
 
-  test("parseAttempts tolerates garbage", () => {
-    expect(parseAttempts(undefined)).toBe(0)
-    expect(parseAttempts("x")).toBe(0)
-    expect(parseAttempts(2)).toBe(2)
+  test("alreadySent reads the flag", () => {
+    expect(alreadySent(undefined)).toBe(false)
+    expect(alreadySent(false)).toBe(false)
+    expect(alreadySent(true)).toBe(true)
+    expect(alreadySent(1)).toBe(true)
   })
 
   test("messageText reads assistant text only", () => {
@@ -170,7 +145,7 @@ describe("system nudge", () => {
     expect(needsSystemNudge([{ role: "assistant", content: [{ type: "text", text: "done" }] }])).toBeUndefined()
   })
 
-  test("silent when the middleware could recover it", () => {
+  test("silent when the live fix could recover it", () => {
     const nudge = needsSystemNudge([
       { role: "assistant", content: [{ type: "text", text: block([invoke("bash", [param("command", "pwd")])]) }] },
     ])
@@ -205,13 +180,9 @@ describe("system nudge", () => {
     ).toBe("no-user-turn")
   })
 
-  test("sseEnabled defaults true; response.sse wins", () => {
-    expect(resolveConfig().sseEnabled).toBe(true)
-    expect(resolveConfig({ response: { sse: false } }).sseEnabled).toBe(false)
-    expect(resolveConfig({ recovery: { sse: false } }).sseEnabled).toBe(false)
-    expect(
-      resolveConfig({ recovery: { sse: false }, response: { sse: true } }).sseEnabled,
-    ).toBe(true)
+  test("responseFix defaults on", () => {
+    expect(resolveConfig().responseFixEnabled).toBe(true)
+    expect(resolveConfig({ responseFix: { enabled: false } }).responseFixEnabled).toBe(false)
   })
 })
 

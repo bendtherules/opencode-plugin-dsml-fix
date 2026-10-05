@@ -1,36 +1,34 @@
 /**
  * opencode-plugin-dsml-fix — recover DeepSeek DSML tool calls that leak as text.
  *
- * Strategy matrix (each independently configurable, see `src/config.ts`):
- * - B1 `strategies.stream`: streaming middleware recovery via ctx.aisdk language hook.
- * - B2 `strategies.generate`: non-streaming generate recovery (same hook).
- * - `strategies.sanitize`: strip leaked DSML spans from replayed history.
- * - `strategies.directive`: preventive correction directive in system.
- * - `strategies.systemNudge`: conditional correction nudge in system when history
- *   ends in unrecovered DSML (transient, never persisted).
- * - `strategies.watchdog`: idle watchdog that wakes stalled sessions; the wake
- *   travels on `resume.channel` ("system" = minimal ping + system nudge,
- *   "user" = legacy full-text synthetic turn).
+ * Four features (see README), each independently configurable:
+ * - `parse`: tolerant parser — complete blocks plus orphan invokes, loose
+ *   parameters, raw-JSON bodies, wrapped tools. Same flags govern live
+ *   recovery and history stain detection.
+ * - `history`: strip leaked spans from replayed assistant text (+ note).
+ *   Never synthesizes calls from history (no double execution).
+ * - `responseFix`: turn leaked markup into real calls on the live response,
+ *   native SSE path and AI-SDK path alike.
+ * - `retry`: conditional correction nudge plus one idle wake per message.
  *
  * Invariant: the plugin must never break normal inference. Unknown shapes pass
- * through untouched, and every strategy degrades to a safer subset via config.
+ * through untouched, and every layer degrades to a safer subset via config.
  */
 
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync } from "node:fs"
 import { appliesToProvider, resolveConfig, type DsmlPluginOptions } from "./config.ts"
 import {
+  alreadySent,
   attemptKey,
   decideResume,
   messageText,
   needsSystemNudge,
-  parseAttempts,
   turnId,
   wakeText,
 } from "./fallback.ts"
 import { createDsmlStreamMiddleware, wrapDsmlLanguageModel } from "./middleware.ts"
 import { parseDsml, redactionNote, stripRangesWithNote, type ParseOptions } from "./parse.ts"
-import { preventiveDirective } from "./prompt.ts"
 import { rewriteSseResponse } from "./sse.ts"
 
 const PLUGIN_ID = "dsml"
@@ -70,8 +68,8 @@ export default Plugin.define({
     // `session/message` identity. Attempts count physical requests within a turn.
     const turns = new Map<string, { turn: string; attempts: number }>()
 
-    // --- Strategies B1+B2: model recovery ------------------------------------
-    if (config.streamEnabled || config.generateEnabled) {
+    // --- Live response fix: model recovery ------------------------------------
+    if (config.responseFixEnabled) {
       await ctx.aisdk.hook("language", (event) => {
         try {
           appendFileSync(
@@ -97,8 +95,8 @@ export default Plugin.define({
         }
         event.language = wrapDsmlLanguageModel(base, {
           ...parseOptions,
-          stream: config.streamEnabled,
-          generate: config.generateEnabled,
+          stream: true,
+          generate: true,
           bufferLimit: config.bufferLimit,
           onSettled: (stats) => {
             const what =
@@ -110,12 +108,12 @@ export default Plugin.define({
       })
     }
 
-    // --- Strategy B3: SSE rewrite on the native protocol path ------------------
+    // --- Live response fix: SSE rewrite on the native protocol path ------------
     // Catalog providers such as opencode-go resolve to the NATIVE
     // openai-compatible route, where `aisdk.language` never fires. The native
     // route offers every request to the http hooks, so rewrite the SSE bytes
     // there instead. Same parser, same policy, different wire format.
-    if (config.sseEnabled) {
+    if (config.responseFixEnabled) {
       await ctx.session.hook("http.response", (event) => {
         if (!appliesToProvider(config, event.model.providerID)) return
         if (event.kind !== "primary") return
@@ -144,7 +142,7 @@ export default Plugin.define({
       })
     }
 
-    // --- Request strategies: directive + sanitize + system nudge ------------
+    // --- Request shaping: sanitize + conditional nudge -------------------------
     await ctx.session.hook("context", async (event) => {
       if (!appliesToProvider(config, event.model.providerID)) return
       // A new user message starts a new turn: reset the attempt counter so the
@@ -155,12 +153,7 @@ export default Plugin.define({
       const label = `${event.sessionID}/${turn}`
       let sanitizedMsgs = 0
       let sanitizedParts = 0
-      let directive = false
       let nudge = false
-      if (config.directiveEnabled) {
-        event.system.push({ type: "text", text: preventiveDirective() })
-        directive = true
-      }
       if (config.sanitizeEnabled) {
         // Strip leaked DSML spans from replayed assistant text so the model does
         // not imitate its own degraded output. A short inline note marks each
@@ -188,30 +181,29 @@ export default Plugin.define({
           if (touched) sanitizedMsgs++
         }
       }
-      if (config.systemNudgeEnabled) {
+      if (config.retryNudgeEnabled) {
         const need = needsSystemNudge(event.messages, parseOptions)
         if (need) {
           const key = attemptKey(event.sessionID, need.key)
-          const attempts = parseAttempts(await ctx.storage.get(key))
-          if (attempts >= config.resumeMaxAttempts) {
-            log("system nudge cap reached for", need.key)
+          if (alreadySent(await ctx.storage.get(key))) {
+            log("nudge already sent for", need.key)
           } else {
-            await ctx.storage.set(key, attempts + 1)
+            await ctx.storage.set(key, true)
             event.system.push({ type: "text", text: need.text })
             nudge = true
           }
         }
       }
       // One line per request turn: what each request layer actually did.
-      if (sanitizedMsgs > 0 || directive || nudge) {
+      if (sanitizedMsgs > 0 || nudge) {
         log(
-          `request ${label} sanitized=${sanitizedMsgs}msgs/${sanitizedParts}parts directive=${directive ? "yes" : "no"} nudge=${nudge ? "yes" : "no"}`,
+          `request ${label} sanitized=${sanitizedMsgs}msgs/${sanitizedParts}parts nudge=${nudge ? "yes" : "no"}`,
         )
       }
     })
 
-    // --- Strategy: idle watchdog ----------------------------------------------
-    if (!config.watchdogEnabled) return
+    // --- Retry: one idle wake per stalled message -------------------------------
+    if (!config.retryEnabled) return
     const controller = new AbortController()
     void (async () => {
       try {
@@ -254,22 +246,22 @@ async function maybeWake(
   })
   if (!text) return
   const key = attemptKey(sessionID, last.id)
-  const attempts = parseAttempts(await ctx.storage.get(key))
-  const decision = decideResume(text, attempts, config.resumeMaxAttempts)
+  const sent = alreadySent(await ctx.storage.get(key))
+  const decision = decideResume(text, sent)
   if (!decision.send || !decision.text) {
     if (decision.reason && decision.reason !== "no-marker") log(decision.reason, "for", last.id)
     return
   }
-  await ctx.storage.set(key, attempts + 1)
-  if (config.resumeChannel === "user") {
-    // Legacy: the full correction travels as a synthetic user turn.
+  await ctx.storage.set(key, true)
+  if (config.retryChannel === "user") {
+    // The full correction travels as a synthetic user turn.
     await ctx.session.synthetic({ sessionID, text: decision.text })
   } else {
     // System channel: minimal wake ping; the context hook attaches the full
     // correction as a transient system instruction on the woken turn.
     await ctx.session.synthetic({ sessionID, text: wakeText(), description: "dsml-retry wake" })
   }
-  log("sent wake for", last.id, `attempt ${attempts + 1} channel=${config.resumeChannel}`)
+  log("sent wake for", last.id, `channel=${config.retryChannel}`)
 }
 
 export { createDsmlStreamMiddleware }
