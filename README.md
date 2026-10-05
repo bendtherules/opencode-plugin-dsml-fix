@@ -1,34 +1,84 @@
 # opencode-plugin-dsml-fix
 
 OpenCode V2 plugin that recovers DeepSeek DSML tool calls when the provider's
-parser fails and the raw markup leaks into assistant text.
+parser fails and raw markup leaks into assistant text as prose.
 
-## What it does
+## The problem
 
-1. **Streaming recovery (strategy B).** Wraps the provider language model via
-   `ctx.aisdk.hook("language")`. Leaked DSML blocks in `text-delta` parts become
-   real AI-SDK `tool-input-*` + `tool-call` parts, and `finishReason` flips from
-   `stop` to `tool-calls` — so the agent loop dispatches the intended call instead
-   of stalling. Reasoning and native tool parts pass through untouched.
-2. **History sanitization.** Strips leaked DSML spans from replayed assistant text
-   so the model stops imitating its own degraded output. Never synthesizes calls
-   from history (no double execution).
-3. **Correction directive.** A system instruction stating the exact required envelope
-   (complete outer block layer, one invoke per call, parameters inside invokes).
-4. **Auto-resume safety net (strategy A).** On session idle with unrecovered DSML
-   markup, sends one short retry nudge, capped per message via plugin storage.
+On DeepSeek served through OpenCode (notably `opencode-go/deepseek-*`), tool
+calls sometimes arrive as visible XML-ish markup in the assistant message
+instead of executing — the agent stalls or pastes the markup back at you. It
+happens most in long sessions, where the provider's parser degrades: the outer
+block opener goes missing, invoke openers get mangled, and only the inner
+parameter tags survive.
+
+This plugin repairs those leaks client-side, in OpenCode, without waiting on
+the provider. Normal responses pass through byte-identical.
 
 ## Install
 
-Add to `opencode.jsonc`:
-
 ```jsonc
+// opencode.jsonc
 {
-  "plugins": ["/code/opencode-dsml-plugin"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-plugin-dsml-fix"],
 }
 ```
 
-Or publish and reference the package name. Requires OpenCode V2 (`2.0.x`).
+Requires OpenCode V2 (`2.0.x`). No other setup — defaults cover the
+`opencode-go` and `opencode` (Zen) providers.
+
+To confirm it's loaded, run any prompt and look for the probe log
+(`debug: true`, see below).
+
+## What it does
+
+- **Streaming recovery.** Leaked DSML blocks in response text become real tool
+  calls, so the agent loop dispatches the intended call instead of stalling.
+  Covers both the native SSE path (what `opencode-go` uses) and the AI-SDK
+  path (other providers).
+- **History sanitization.** Strips leaked markup from replayed assistant
+  messages so the model stops imitating its own degraded output. History is
+  never turned into calls — no double execution.
+- **Prevention.** A system directive states the exact required envelope, plus
+  a conditional nudge when a turn ends with unrecovered markup.
+- **Safety net.** An idle watchdog sends one short retry when a session stalls
+  on unrecovered markup, capped per message.
+
+Every layer is independently toggleable (see Configuration). If any layer
+misfires, switch that one flag off — the plugin degrades to a safer subset
+and never breaks normal inference.
+
+## Verify it's working
+
+Enable debug logging:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "opencode-plugin-dsml-fix",
+      "options": { "debug": true },
+    },
+  ],
+}
+```
+
+Each turn logs one request line and one line per response attempt,
+identified as `sessionID/user-messageID` (`#n` counts retries in the turn):
+
+```
+[dsml] request ses_abc/msg_xyz sanitized=2msgs/3parts directive=yes nudge=no
+[dsml] response ses_abc/msg_xyz#1 recovered=1
+[dsml] response ses_abc/msg_xyz#2 passthrough
+```
+
+- `sanitized=Nmsgs/Mparts` — replayed history stripped (plus a short note).
+- `recovered=N` — tool calls rescued from leaked markup. The fix fired.
+- `passthrough` — no markup seen, bytes untouched.
+- `held-candidate-no-call` — something looked like markup but parsed to
+  nothing (emitted verbatim). Frequent sightings mean a new variant worth
+  reporting — file an issue with the excerpt.
 
 ## Configuration
 
@@ -36,75 +86,54 @@ Or publish and reference the package name. Requires OpenCode V2 (`2.0.x`).
 {
   "plugins": [
     {
-      "package": "/code/opencode-dsml-plugin",
+      "package": "opencode-plugin-dsml-fix",
       "options": {
         "providers": ["opencode-go", "opencode"],
         "mode": "relaxed",
-        "resume": { "enabled": true, "maxAttempts": 3 }
-      }
-    }
-  ]
+        "resume": { "enabled": true, "maxAttempts": 3 },
+      },
+    },
+  ],
 }
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `providers` | `["opencode-go","opencode"]` | Provider IDs in scope. Empty disables the plugin. |
-| `mode` | `"relaxed"` | `"relaxed"` = full catalogue; `"strict"` = complete blocks only. |
-| `rescue.orphanInvoke` | mode | Recover invokes with no outer opener. |
+| `mode` | `"relaxed"` | `"relaxed"` = full variant catalogue; `"strict"` = complete blocks only. |
+| `rescue.orphanInvoke` | mode | Invokes with no outer opener. |
 | `rescue.looseParameters` | mode | Tolerant re-scan past broken closers. |
 | `rescue.rawJsonBody` | mode | Bare-JSON invoke bodies. |
 | `rescue.wrappedTool` | mode | Orphan `<parameter name="X">` with complete inner params. |
 | `bufferLimit` | `65536` | Streaming hold cap in bytes. |
-| `response.sse` | `true` | Native path: rewrite SSE bytes in `http.response`. |
-| `response.aisdkStream` | `true` | AI-SDK path: wrap language model, streaming parts. |
-| `response.aisdkGenerate` | `true` | AI-SDK path: wrap language model, generate results. |
-| `request.sanitize` | `true` | Strip leaked spans from replayed history (+ one note). |
-| `request.directive` | `true` | Preventive system directive (alias: `prompt.enabled`). |
-| `request.systemNudge` | `true` | Conditional correction in system on unrecovered tail. |
-| `resume.enabled` | `true` | Idle watchdog wake (alias: `strategies.watchdog`). |
+| `response.sse` | `true` | Native path: rewrite SSE bytes (`http.response`). |
+| `response.aisdkStream` | `true` | AI-SDK path: streaming parts. |
+| `response.aisdkGenerate` | `true` | AI-SDK path: non-streaming results. |
+| `request.sanitize` | `true` | Strip leaked spans from replayed history. |
+| `request.directive` | `true` | Preventive system directive. |
+| `request.systemNudge` | `true` | Conditional correction when a turn ends unrecovered. |
+| `resume.enabled` | `true` | Idle watchdog wake. |
 | `resume.maxAttempts` | `3` | Cap per assistant message. |
-| `resume.channel` | `"system"` | `"system"` = minimal ping + system nudge; `"user"` = legacy full-text synthetic turn. |
-| `debug` | `false` | Log recoveries to stderr + probe file. |
+| `resume.channel` | `"system"` | `"system"` = minimal ping + nudge; `"user"` = legacy full-text turn. |
+| `debug` | `false` | Per-turn impact logging (see above). |
 
-`recovery.*` and `strategies.*` remain as deprecated aliases
-(`sse`→`response.sse`, `stream`→`response.aisdkStream`,
-`generate`→`response.aisdkGenerate`, `sanitize`/`directive`/`systemNudge`→`request.*`,
-`watchdog`→`resume.enabled`). Precedence: `response`/`request` > `recovery` >
-`strategies` > legacy `resume`/`prompt` > default.
-If any layer misfires, switch that one flag off (or `mode: "strict"`) — the plugin
-degrades to the safer subset and never breaks normal inference.
-
-## Per-turn impact logging (`debug: true`)
-
-Every request turn logs one line; every response stream logs one line on close.
-Turns are identified as `sessionID/user-messageID` — OpenCode's own message
-identity — with `#n` counting physical requests (retries) within the turn:
-
-```
-[dsml] request ses_abc/msg_xyz sanitized=2msgs/3parts directive=yes nudge=no
-[dsml] response ses_abc/msg_xyz#1 recovered=1
-[dsml] response ses_abc/msg_xyz#2 passthrough
-[dsml] response ses_abc/msg_xyz#3 held-candidate-no-call
-```
-
-- `sanitized=Nmsgs/Mparts`: replayed history messages/parts stripped (+ note).
-- `directive`/`nudge`: whether system text was added this turn.
-- `recovered=N`: tool calls recovered from leaked markup this turn.
-- `passthrough`: no DSML candidate ever seen — bytes untouched.
-- `held-candidate-no-call`: something looked like markup but parsed to nothing
-  (emitted verbatim). If you see this often, send the log excerpt — it's a new
-  variant to catalogue.
+Older names (`recovery.*`, `strategies.*`, `resume.*`, `prompt.*`) still work
+as aliases. Precedence: `response`/`request` > `recovery` > `strategies` >
+legacy names > defaults.
 
 ## Development
 
 ```bash
 bun install
-bun test        # 111 tests across grammar/parser/stream/wrapper/config/sse
-bun run check   # typecheck + tests (tsc --noEmit)
+bun test        # 115 tests: grammar, parser, stream, wrapper, config, sse, golden
+bun run check   # typecheck + tests
 ```
 
-- `docs/PATTERNS.md` — variant catalogue (source of truth for every regex)
+- `docs/PATTERNS.md` — failure-shape catalogue (source of truth for recovery)
 - `docs/TEST-MATRIX.md` — behaviour ↔ test map
-- `docs/STATUS.md` — handoff / project status
-- `test/fixtures.ts` — fixture builders (the repo never stores a live DSML token)
+- `test/golden/` — synthetic byte-faithful fixtures + generator
+  (`build-fixtures.ts`); the repo never stores live markup tokens
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

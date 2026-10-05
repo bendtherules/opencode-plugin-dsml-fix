@@ -6,22 +6,37 @@
   "license": "MIT",
   "description": "OpenCode V2 plugin that recovers DeepSeek DSML tool calls leaked as assistant text",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./dist/index.js"
   },
   "files": [
-    "src"
+    "dist"
   ],
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsgo --noEmit",
-    "check": "bun run typecheck && bun test"
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode/plugin --external @ai-sdk/provider",
+    "prepublishOnly": "bun run check && bun run build"
   },
   "dependencies": {
-    "@ai-sdk/provider": "^3.0.8"
+    "@ai-sdk/provider": "^3.0.8",
+    "@opencode/plugin": "2.0.22"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.22",
     "bun-types": "latest",
     "typescript": "^5.6.0"
-  }
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "deepseek",
+    "dsml",
+    "tool-calls"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bendtherules/opencode-plugin-dsml-fix.git"
+  },
+  "homepage": "https://github.com/bendtherules/opencode-plugin-dsml-fix",
+  "author": "bendtherules"
 }
