@@ -22,8 +22,8 @@ fix **new streams** and repair **old stored transcripts**.
 - Failing path in the user's real session: provider **`opencode-go`**, model
   **`deepseek-v4.1-flash`**, package **`@ai-sdk/openai-compatible`**, baseURL
   `https://opencode.ai/zen/go/v1`. The `opencode` (Zen) provider uses the same shape.
-- Trigger (evidence from a real long-context session: an Android speech-to-text
-  project on `opencode-go/deepseek-v4.1-flash`): **all leaks happen late in a huge
+- Trigger (evidence from a real long-context DeepSeek session on
+  `opencode-go/deepseek-v4.1-flash`): **all leaks happen late in a huge
   context** (seq 5177+ of ~5700 messages). Degradation:
   outer `<DSML tool_calls>` opener missing, `invoke` opener mangled to a bare
   `parameter name="edit"`, and only inner params carry the DSML token. `finish_reason`

@@ -1,7 +1,7 @@
 /**
  * SSE rewriter tests. Mirror of test/stream.test.ts, asserting on the rewritten
  * OpenAI-Chat SSE bytes — the exact contract the native protocol parser reads.
- * Plus a golden run over the real DB failure messages serialized as SSE.
+ * Plus a golden run over the synthetic fixtures serialized as SSE.
  */
 
 import { describe, expect, test } from "bun:test"
